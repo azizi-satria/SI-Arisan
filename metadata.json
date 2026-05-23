@@ -1,0 +1,6 @@
+{
+  "name": "Sistem Manajemen Arisan Modern",
+  "description": "Aplikasi manajemen arisan digital modern dengan fitur kocok arisan ganda, pencatatan iuran kas konsumsi, pelacakan tunggakan (utang) antar putaran, dan laporan keuangan rill.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
