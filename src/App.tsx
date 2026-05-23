@@ -29,6 +29,7 @@ import {
 
 import { Period, Member, Winner, Expense, Payment } from './types';
 import { initialPeriods } from './data';
+import { api } from './api';
 
 // Import our custom sub-components
 import Sidebar from './components/Sidebar';
@@ -41,29 +42,60 @@ import KocokModal from './components/KocokModal';
 
 export default function App() {
   // ---------------- STATE READ / WRITE ----------------
-  const [periods, setPeriods] = useState<Period[]>(() => {
-    const saved = localStorage.getItem('arisan_pro_periods');
-    if (saved) {
-      try {
-        return JSON.parse(saved);
-      } catch (e) {
-        console.error("Error reading periods from localStorage", e);
+  const [periods, setPeriods] = useState<Period[]>([]);
+  const [activePeriodId, setActivePeriodId] = useState<string | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isSyncing, setIsSyncing] = useState(false);
+
+  // Sync / refresh from DB
+  const refreshData = async (silent = false) => {
+    try {
+      if (!silent) setIsLoading(true);
+      const data = await api.getPeriods();
+      setPeriods(data);
+      
+      const savedActiveId = localStorage.getItem('arisan_pro_active_id');
+      if (savedActiveId && data.some((p) => p.id === savedActiveId)) {
+        setActivePeriodId(savedActiveId);
+      } else if (data.length > 0) {
+        setActivePeriodId(data[0].id);
+      } else {
+        setActivePeriodId(null);
       }
+    } catch (err) {
+      console.error('Gagal memuat data dari MongoDB, menggunakan local fallback:', err);
+      // Fallback localstorage
+      const saved = localStorage.getItem('arisan_pro_periods');
+      if (saved) {
+        try {
+          const parsed = JSON.parse(saved);
+          setPeriods(parsed);
+          const savedActiveId = localStorage.getItem('arisan_pro_active_id');
+          if (savedActiveId && parsed.some((p: any) => p.id === savedActiveId)) {
+            setActivePeriodId(savedActiveId);
+          } else if (parsed.length > 0) {
+            setActivePeriodId(parsed[0].id);
+          }
+        } catch (e) {
+          setPeriods(initialPeriods);
+        }
+      } else {
+        setPeriods(initialPeriods);
+      }
+    } finally {
+      if (!silent) setIsLoading(false);
     }
-    return initialPeriods;
-  });
+  };
 
-  const [activePeriodId, setActivePeriodId] = useState<string | null>(() => {
-    const saved = localStorage.getItem('arisan_pro_active_id');
-    if (saved) {
-      return saved;
-    }
-    return periods.length > 0 ? periods[0].id : null;
-  });
-
-  // Keep localStorage updated
   useEffect(() => {
-    localStorage.setItem('arisan_pro_periods', JSON.stringify(periods));
+    refreshData();
+  }, []);
+
+  // Save to localStorage as quick local client fallback redundancy
+  useEffect(() => {
+    if (periods.length > 0) {
+      localStorage.setItem('arisan_pro_periods', JSON.stringify(periods));
+    }
   }, [periods]);
 
   useEffect(() => {
@@ -230,7 +262,7 @@ export default function App() {
     const roundWinners = activePeriod.winners.filter((w) => w.round === winner.round);
     const roundWinnersCount = roundWinners.length || 1;
 
-    // Target prize is target pot split equally among winners of that round
+    // Target prize is target pool split equally among winners of that round
     const targetPrize = totalTargetPot / roundWinnersCount;
 
     // Real collected prize: only based on members that already paid for that round
@@ -273,44 +305,42 @@ export default function App() {
     setIsPeriodModalOpen(true);
   };
 
-  const handleSavePeriod = (
+  const handleSavePeriod = async (
     id: string | null,
     name: string,
     targetMembers: number,
     nominalArisan: number,
     nominalKonsumsi: number
   ) => {
-    if (id) {
-      // Edit mode
-      setPeriods((prev) =>
-        prev.map((p) =>
-          p.id === id ? { ...p, name, targetMembers, nominalArisan, nominalKonsumsi } : p
-        )
-      );
-      showToast('Konfigurasi Pengaturan Periode Berhasil Disimpan.', 'success');
-    } else {
-      // Create mode
-      const newPeriod: Period = {
-        id: 'p_' + Math.random().toString(36).substring(2, 9),
-        name,
-        targetMembers,
-        nominalArisan,
-        nominalKonsumsi,
-        currentRound: 1,
-        members: clonedMembersTemp || [],
-        winners: [],
-        expenses: [],
-        initialSisaKas: clonedSisaKasTemp || 0,
-        isClosed: false,
-      };
-      setPeriods((prev) => [...prev, newPeriod]);
-      setActivePeriodId(newPeriod.id);
-      showToast(`Periode "${name}" Berhasil Dibentuk!`, 'success');
+    try {
+      setIsSyncing(true);
+      if (id) {
+        // Edit mode
+        await api.updatePeriod(id, { name, targetMembers, nominalArisan, nominalKonsumsi });
+        showToast('Konfigurasi Pengaturan Periode Berhasil Disimpan.', 'success');
+      } else {
+        // Create mode
+        const created = await api.createPeriod({
+          name,
+          targetMembers,
+          nominalArisan,
+          nominalKonsumsi,
+          initialSisaKas: clonedSisaKasTemp || 0,
+          clonedMembers: clonedMembersTemp || undefined,
+        });
+        setActivePeriodId(created.id);
+        showToast(`Periode "${name}" Berhasil Dibentuk!`, 'success');
+      }
+      // Reset temp cloning state
+      setClonedMembersTemp(null);
+      setClonedSisaKasTemp(null);
+      setIsPeriodModalOpen(false);
+      await refreshData();
+    } catch (err: any) {
+      showToast(`Gagal menyimpan periode: ${err.message}`, 'error');
+    } finally {
+      setIsSyncing(false);
     }
-    // Reset temp cloning state
-    setClonedMembersTemp(null);
-    setClonedSisaKasTemp(null);
-    setIsPeriodModalOpen(false);
   };
 
   const handleDeletePeriod = () => {
@@ -319,15 +349,16 @@ export default function App() {
     triggerConfirmation(
       'Hapus Periode Arisan',
       `Tindakan ini permanen. Semua data anggota, riwayat pemenang, kas konsumsi, dan laporan keuangan rill dari "${activePeriod.name}" akan terhapus sepenuhnya.`,
-      () => {
-        const idToRemove = activePeriod.id;
-        const updated = periods.filter((p) => p.id !== idToRemove);
-        setPeriods(updated);
-        showToast('Periode Arisan Berhasil Dihapus.', 'warning');
-        if (updated.length > 0) {
-          setActivePeriodId(updated[0].id);
-        } else {
-          setActivePeriodId(null);
+      async () => {
+        try {
+          setIsSyncing(true);
+          await api.deletePeriod(activePeriod.id);
+          showToast('Periode Arisan Berhasil Dihapus.', 'warning');
+          await refreshData();
+        } catch (err: any) {
+          showToast(`Gagal menghapus periode: ${err.message}`, 'error');
+        } finally {
+          setIsSyncing(false);
         }
       }
     );
@@ -338,13 +369,17 @@ export default function App() {
     triggerConfirmation(
       'Tutup & Arsipkan Periode',
       `Apakah Anda yakin ingin menutup dan mengarsipkan Periode "${activePeriod.name}"? Aktivitas iuran, kocok pemenang, pengeluaran kas, dan manipulasi anggota akan dikunci secara permanen.`,
-      () => {
-        setPeriods((prev) =>
-          prev.map((p) =>
-            p.id === activePeriod.id ? { ...p, isClosed: true } : p
-          )
-        );
-        showToast(`Periode "${activePeriod.name}" Berhasil Ditutup & Diarsipkan!`, 'success');
+      async () => {
+        try {
+          setIsSyncing(true);
+          await api.updatePeriod(activePeriod.id, { isClosed: true });
+          showToast(`Periode "${activePeriod.name}" Berhasil Ditutup & Diarsipkan!`, 'success');
+          await refreshData();
+        } catch (err: any) {
+          showToast(`Gagal menutup periode: ${err.message}`, 'error');
+        } finally {
+          setIsSyncing(false);
+        }
       }
     );
   };
@@ -355,17 +390,14 @@ export default function App() {
       'Reset & Lanjutkan Periode Baru',
       `Apakah Anda bersedia melanjutkan arisan ke periode kelanjutan baru? Kami akan secara otomatis menyalin (${activePeriod.members.length}) anggota dari "${activePeriod.name}" dan mentransfer sisa kas konsumsi akhir sebesar ${formatRupiah(metrics.kasSisa)} sebagai saldo awal kas baru.`,
       () => {
-        const clonedMembers: Member[] = activePeriod.members.map((m) => ({
-          id: 'm_' + Math.random().toString(36).substring(2, 9),
+        const clonedMembers = activePeriod.members.map((m) => ({
           name: m.name,
-          payments: [],
-          hasWon: false,
         }));
 
-        setClonedMembersTemp(clonedMembers);
+        setClonedMembersTemp(clonedMembers as any);
         setClonedSisaKasTemp(metrics.kasSisa);
 
-        // Prep continuation period modal fields (editingPeriod is empty ID but filled settings)
+        // Prep continuation period modal fields
         setEditingPeriod({
           id: '',
           name: `${activePeriod.name} - Putaran Selanjutnya`,
@@ -398,52 +430,36 @@ export default function App() {
     setIsMemberModalOpen(true);
   };
 
-  const handleSaveMember = (id: string | null, name: string, isPaidCurrentRound: boolean) => {
+  const handleSaveMember = async (id: string | null, name: string, isPaidCurrentRound: boolean) => {
     if (!activePeriod) return;
     const currentR = activePeriod.currentRound || 1;
 
-    if (id) {
-      // Edit existing member
-      setPeriods((prev) =>
-        prev.map((p) => {
-          if (p.id !== activePeriod.id) return p;
-          const updatedMembers = p.members.map((m) => {
-            if (m.id !== id) return m;
-            
-            let updatedPayments = [...(m.payments || [])];
-            const hasPaidInCurrentRound = updatedPayments.some((pay) => pay.round === currentR);
-
-            if (isPaidCurrentRound && !hasPaidInCurrentRound) {
-              updatedPayments.push({ round: currentR, paidInRound: currentR });
-            } else if (!isPaidCurrentRound && hasPaidInCurrentRound) {
-              updatedPayments = updatedPayments.filter((pay) => pay.round !== currentR);
-            }
-
-            return { ...m, name, payments: updatedPayments };
-          });
-
-          return { ...p, members: updatedMembers };
-        })
-      );
-      showToast(`Data anggota "${name}" berhasil diperbarui.`, 'success');
-    } else {
-      // Create new member
-      const newMember: Member = {
-        id: 'm_' + Math.random().toString(36).substring(2, 9),
-        name,
-        payments: isPaidCurrentRound ? [{ round: currentR, paidInRound: currentR }] : [],
-        hasWon: false,
-      };
-
-      setPeriods((prev) =>
-        prev.map((p) => {
-          if (p.id !== activePeriod.id) return p;
-          return { ...p, members: [...p.members, newMember] };
-        })
-      );
-      showToast(`${name} berhasil didaftarkan sebagai anggota arisan!`, 'success');
+    try {
+      setIsSyncing(true);
+      if (id) {
+        // Edit existing member
+        const updated = await api.editMember(activePeriod.id, id, name);
+        const hasPaidInCurrentRound = updated.payments?.some((p) => p.round === currentR) || false;
+        
+        if (isPaidCurrentRound !== hasPaidInCurrentRound) {
+          await api.togglePayment(activePeriod.id, id, currentR, currentR);
+        }
+        showToast(`Data anggota "${name}" berhasil diperbarui.`, 'success');
+      } else {
+        // Create new member
+        const created = await api.addMember(activePeriod.id, name);
+        if (isPaidCurrentRound) {
+          await api.togglePayment(activePeriod.id, created.id, currentR, currentR);
+        }
+        showToast(`${name} berhasil didaftarkan sebagai anggota arisan!`, 'success');
+      }
+      setIsMemberModalOpen(false);
+      await refreshData();
+    } catch (err: any) {
+      showToast(`Gagal menyimpan anggota: ${err.message}`, 'error');
+    } finally {
+      setIsSyncing(false);
     }
-    setIsMemberModalOpen(false);
   };
 
   const handleDeleteMember = (memberId: string, name: string) => {
@@ -451,24 +467,23 @@ export default function App() {
     triggerConfirmation(
       'Keluarkan Anggota',
       `Apakah Anda yakin ingin mengeluarkan "${name}" dari periode ini? Semua histori pemenang & pembayaran iuran miliknya akan ikut dibersihkan.`,
-      () => {
-        setPeriods((prev) =>
-          prev.map((p) => {
-            if (p.id !== activePeriod.id) return p;
-            return {
-              ...p,
-              members: p.members.filter((m) => m.id !== memberId),
-              winners: p.winners.filter((w) => w.memberId !== memberId),
-            };
-          })
-        );
-        showToast(`Anggota "${name}" berhasil dikeluarkan dari arisan.`, 'warning');
+      async () => {
+        try {
+          setIsSyncing(true);
+          await api.deleteMember(activePeriod.id, memberId);
+          showToast(`Anggota "${name}" berhasil dikeluarkan dari arisan.`, 'warning');
+          await refreshData();
+        } catch (err: any) {
+          showToast(`Gagal mengeluarkan anggota: ${err.message}`, 'error');
+        } finally {
+          setIsSyncing(false);
+        }
       }
     );
   };
 
   // --- Toggle Monthly Fee Settlement ---
-  const handleToggleIuranCurrentRound = (memberId: string) => {
+  const handleToggleIuranCurrentRound = async (memberId: string) => {
     if (!activePeriod) return;
     const currentR = activePeriod.currentRound || 1;
     const member = activePeriod.members.find((m) => m.id === memberId);
@@ -476,34 +491,20 @@ export default function App() {
 
     const hasPaid = member.payments?.some((pay) => pay.round === currentR) || false;
 
-    if (hasPaid) {
-      showToast(`Status iuran ditarik kembali untuk ${member.name}.`, 'warning');
-    } else {
-      showToast(`Pembayaran iuran ${member.name} diverifikasi Lunas.`, 'success');
+    try {
+      setIsSyncing(true);
+      await api.togglePayment(activePeriod.id, memberId, currentR, currentR);
+      if (hasPaid) {
+        showToast(`Status iuran ditarik kembali untuk ${member.name}.`, 'warning');
+      } else {
+        showToast(`Pembayaran iuran ${member.name} diverifikasi Lunas.`, 'success');
+      }
+      await refreshData();
+    } catch (err: any) {
+      showToast(`Gagal mencatat pembayaran: ${err.message}`, 'error');
+    } finally {
+      setIsSyncing(false);
     }
-
-    setPeriods((prev) =>
-      prev.map((p) => {
-        if (p.id !== activePeriod.id) return p;
-        const updatedMembers = p.members.map((m) => {
-          if (m.id !== memberId) return m;
-          
-          let updatedPayments = m.payments ? [...m.payments] : [];
-
-          if (hasPaid) {
-            // Remove current payment
-            updatedPayments = updatedPayments.filter((pay) => pay.round !== currentR);
-          } else {
-            // Add current payment
-            updatedPayments.push({ round: currentR, paidInRound: currentR });
-          }
-
-          return { ...m, payments: updatedPayments };
-        });
-
-        return { ...p, members: updatedMembers };
-      })
-    );
   };
 
   // --- Mass Settlement Lunas Semua ---
@@ -517,24 +518,17 @@ export default function App() {
     triggerConfirmation(
       'Tandai Semua Lunas',
       `Apakah Anda yakin ingin memverifikasi pelunasan massal iuran (arisan & kas konsumsi) untuk seluruh (${activePeriod.members.length}) anggota pada Putaran ${activePeriod.currentRound} ini?`,
-      () => {
-        const currentR = activePeriod.currentRound || 1;
-        setPeriods((prev) =>
-          prev.map((p) => {
-            if (p.id !== activePeriod.id) return p;
-            const updatedMembers = p.members.map((m) => {
-              const alreadyPaid = m.payments?.some((pay) => pay.round === currentR) || false;
-              if (alreadyPaid) return m;
-
-              const updatedPayments = m.payments ? [...m.payments] : [];
-              updatedPayments.push({ round: currentR, paidInRound: currentR });
-              return { ...m, payments: updatedPayments };
-            });
-
-            return { ...p, members: updatedMembers };
-          })
-        );
-        showToast('Kas Berhasil Diperbarui: Seluruh anggota ditandai Lunas masal!', 'success');
+      async () => {
+        try {
+          setIsSyncing(true);
+          await api.payAllCurrentRound(activePeriod.id, activePeriod.currentRound || 1);
+          showToast('Kas Berhasil Diperbarui: Seluruh anggota ditandai Lunas masal!', 'success');
+          await refreshData();
+        } catch (err: any) {
+          showToast(`Gagal melunasi iuran massal: ${err.message}`, 'error');
+        } finally {
+          setIsSyncing(false);
+        }
       }
     );
   };
@@ -557,14 +551,17 @@ export default function App() {
     triggerConfirmation(
       'Buka Putaran Baru',
       `Apakah Anda bersedia menutup Putaran ${currentR} dan membuka Putaran Baru ${currentR + 1}? Iuran bulanan anggota akan kembali ke status 'Belum Bayar' dan iuran tertinggal otomatis dilacak sebagai tunggakan.`,
-      () => {
-        setPeriods((prev) =>
-          prev.map((p) => {
-            if (p.id !== activePeriod.id) return p;
-            return { ...p, currentRound: currentR + 1 };
-          })
-        );
-        showToast(`Selamat! Putaran ${currentR + 1} resmi diaktifkan.`, 'success');
+      async () => {
+        try {
+          setIsSyncing(true);
+          await api.updatePeriod(activePeriod.id, { currentRound: currentR + 1 });
+          showToast(`Selamat! Putaran ${currentR + 1} resmi diaktifkan.`, 'success');
+          await refreshData();
+        } catch (err: any) {
+          showToast(`Gagal melangkah ke putaran berikutnya: ${err.message}`, 'error');
+        } finally {
+          setIsSyncing(false);
+        }
       }
     );
   };
@@ -575,36 +572,19 @@ export default function App() {
     setIsDebtModalOpen(true);
   };
 
-  const handlePayDebtRound = (round: number) => {
+  const handlePayDebtRound = async (round: number) => {
     if (!activePeriod || !debtMember) return;
     const currentR = activePeriod.currentRound || 1;
 
-    // Record payment for that historical round, marked as paidInRound = currentRound
-    let updatedMemberName = '';
-    setPeriods((prev) =>
-      prev.map((p) => {
-        if (p.id !== activePeriod.id) return p;
-        const updatedMembers = p.members.map((m) => {
-          if (m.id !== debtMember.id) return m;
-          
-          updatedMemberName = m.name;
-          const updatedPayments = m.payments ? [...m.payments] : [];
-          // Double safeguard to make sure we don't duplicate
-          if (!updatedPayments.some((pay) => pay.round === round)) {
-            updatedPayments.push({ round, paidInRound: currentR });
-          }
-          return { ...m, payments: updatedPayments };
-        });
+    try {
+      setIsSyncing(true);
+      await api.togglePayment(activePeriod.id, debtMember.id, round, currentR);
+      showToast(`Tunggakan Putaran ${round} untuk "${debtMember.name}" berhasil dilunasi. Cashflow diperbarui.`, 'success');
+      
+      const freshPeriods = await api.getPeriods();
+      setPeriods(freshPeriods);
 
-        return { ...p, members: updatedMembers };
-      })
-    );
-
-    showToast(`Tunggakan Putaran ${round} untuk "${updatedMemberName}" berhasil dilunasi. Cashflow diperbarui.`, 'success');
-
-    // Instantly sync the localized state of the debt member to review any further debts
-    setPeriods((latestPeriods) => {
-      const freshPeriod = latestPeriods.find((p) => p.id === activePeriod.id);
+      const freshPeriod = freshPeriods.find((p) => p.id === activePeriod.id);
       const freshMember = freshPeriod?.members.find((m) => m.id === debtMember.id);
       if (freshMember) {
         setDebtMember(freshMember);
@@ -619,9 +599,15 @@ export default function App() {
           setIsDebtModalOpen(false);
           setDebtMember(null);
         }
+      } else {
+        setIsDebtModalOpen(false);
+        setDebtMember(null);
       }
-      return latestPeriods;
-    });
+    } catch (err: any) {
+      showToast(`Gagal melunasi tunggakan: ${err.message}`, 'error');
+    } finally {
+      setIsSyncing(false);
+    }
   };
 
   // --- Expenses ---
@@ -635,7 +621,7 @@ export default function App() {
     setIsExpenseModalOpen(true);
   };
 
-  const handleSaveExpense = (id: string | null, description: string, amount: number) => {
+  const handleSaveExpense = async (id: string | null, description: string, amount: number) => {
     if (!activePeriod) return;
     const today = new Date();
     const dateStr = today.toLocaleDateString('id-ID', {
@@ -644,38 +630,24 @@ export default function App() {
       year: 'numeric',
     });
 
-    if (id) {
-      // Edit expense
-      setPeriods((prev) =>
-        prev.map((p) => {
-          if (p.id !== activePeriod.id) return p;
-          return {
-            ...p,
-            expenses: p.expenses.map((e) =>
-              e.id === id ? { ...e, description, amount, date: dateStr } : e
-            ),
-          };
-        })
-      );
-      showToast('Catatan pengeluaran kas berhasil diperbarui.', 'success');
-    } else {
-      // Create expense
-      const newExp: Expense = {
-        id: 'e_' + Math.random().toString(36).substring(2, 9),
-        description,
-        amount,
-        date: dateStr,
-      };
-
-      setPeriods((prev) =>
-        prev.map((p) => {
-          if (p.id !== activePeriod.id) return p;
-          return { ...p, expenses: [...p.expenses, newExp] };
-        })
-      );
-      showToast('Pengeluaran kas berhasil dicatat dan diposting.', 'success');
+    try {
+      setIsSyncing(true);
+      if (id) {
+        // Edit expense
+        await api.editExpense(activePeriod.id, id, { description, amount, date: dateStr });
+        showToast('Catatan pengeluaran kas berhasil diperbarui.', 'success');
+      } else {
+        // Create expense
+        await api.addExpense(activePeriod.id, { description, amount, date: dateStr });
+        showToast('Pengeluaran kas berhasil dicatat dan diposting.', 'success');
+      }
+      setIsExpenseModalOpen(false);
+      await refreshData();
+    } catch (err: any) {
+      showToast(`Gagal menyimpan pengeluaran: ${err.message}`, 'error');
+    } finally {
+      setIsSyncing(false);
     }
-    setIsExpenseModalOpen(false);
   };
 
   const handleDeleteExpense = (expenseId: string) => {
@@ -683,14 +655,17 @@ export default function App() {
     triggerConfirmation(
       'Hapus Catatan Kas Keluar',
       'Hapus catatan pengeluaran kas konsumsi ini? Saldo admin dan kas konsumsi akan dikalkulasi ulang.',
-      () => {
-        setPeriods((prev) =>
-          prev.map((p) => {
-            if (p.id !== activePeriod.id) return p;
-            return { ...p, expenses: p.expenses.filter((e) => e.id !== expenseId) };
-          })
-        );
-        showToast('Catatan kas pengeluaran berhasil dihapus.', 'warning');
+      async () => {
+        try {
+          setIsSyncing(true);
+          await api.deleteExpense(activePeriod.id, expenseId);
+          showToast('Catatan kas pengeluaran berhasil dihapus.', 'warning');
+          await refreshData();
+        } catch (err: any) {
+          showToast(`Gagal menghapus pengeluaran: ${err.message}`, 'error');
+        } finally {
+          setIsSyncing(false);
+        }
       }
     );
   };
@@ -710,7 +685,7 @@ export default function App() {
     setIsKocokModalOpen(true);
   };
 
-  const handleAddWinner = (memberId: string, name: string) => {
+  const handleAddWinner = async (memberId: string, name: string) => {
     if (!activePeriod) return;
     const currentR = activePeriod.currentRound || 1;
     const today = new Date();
@@ -720,76 +695,72 @@ export default function App() {
       year: 'numeric',
     });
 
-    const newWinner: Winner = {
-      id: 'w_' + Math.random().toString(36).substring(2, 9),
-      memberId,
-      name,
-      date: dateStr,
-      round: currentR,
-      isPaid: false, // default to false (managed by admin handovers)
-    };
-
-    setPeriods((prev) =>
-      prev.map((p) => {
-        if (p.id !== activePeriod.id) return p;
-        return {
-          ...p,
-          // Add winner record
-          winners: [...p.winners, newWinner],
-          // Mark member as having won
-          members: p.members.map((m) => (m.id === memberId ? { ...m, hasWon: true } : m)),
-        };
-      })
-    );
+    try {
+      setIsSyncing(true);
+      await api.addWinner(activePeriod.id, {
+        memberId,
+        name,
+        date: dateStr,
+        round: currentR,
+      });
+      showToast(`Pemenang Putaran ${currentR} berhasil diundi: ${name}!`, 'success');
+      await refreshData();
+    } catch (err: any) {
+      showToast(`Gagal menyimpan pemenang: ${err.message}`, 'error');
+    } finally {
+      setIsSyncing(false);
+    }
   };
 
   const handleBatalMenang = (memberId: string, name: string) => {
     if (!activePeriod) return;
+    const winnerRecord = activePeriod.winners.find((w) => w.memberId === memberId);
+    if (!winnerRecord) return;
+
     triggerConfirmation(
       'Batalkan Status Pemenang',
       `Apakah Anda yakin ingin menganulir kemenangan "${name}"? Status anggota akan dikembalikan menjadi 'Belum Menang' dan data ditarik dari riwayat.`,
-      () => {
-        setPeriods((prev) =>
-          prev.map((p) => {
-            if (p.id !== activePeriod.id) return p;
-            return {
-              ...p,
-              winners: p.winners.filter((w) => w.memberId !== memberId),
-              members: p.members.map((m) => (m.id === memberId ? { ...m, hasWon: false } : m)),
-            };
-          })
-        );
-        showToast(`Status pemenang "${name}" dibatalkan.`, 'warning');
+      async () => {
+        try {
+          setIsSyncing(true);
+          await api.deleteWinner(activePeriod.id, winnerRecord.id);
+          showToast(`Status pemenang "${name}" dibatalkan.`, 'warning');
+          await refreshData();
+        } catch (err: any) {
+          showToast(`Gagal menganulir pemenang: ${err.message}`, 'error');
+        } finally {
+          setIsSyncing(false);
+        }
       }
     );
   };
 
-  const handleHandoverWinnerCek = (winnerId: string, name: string) => {
+  const handleHandoverWinnerCek = async (winnerId: string, name: string) => {
     if (!activePeriod) return;
-    setPeriods((prev) =>
-      prev.map((p) => {
-        if (p.id !== activePeriod.id) return p;
-        return {
-          ...p,
-          winners: p.winners.map((w) => (w.id === winnerId ? { ...w, isPaid: true } : w)),
-        };
-      })
-    );
-    showToast(`Uang arisan diserahkan penuh kepada "${name}". Saldo fisik admin berkurang.`, 'success');
+    try {
+      setIsSyncing(true);
+      await api.updateWinnerPayment(activePeriod.id, winnerId, true);
+      showToast(`Uang arisan diserahkan penuh kepada "${name}". Saldo fisik admin berkurang.`, 'success');
+      await refreshData();
+    } catch (err: any) {
+      showToast(`Gagal melunasi pemenang: ${err.message}`, 'error');
+    } finally {
+      setIsSyncing(false);
+    }
   };
 
-  const handleCancelHandoverWinnerCek = (winnerId: string, name: string) => {
+  const handleCancelHandoverWinnerCek = async (winnerId: string, name: string) => {
     if (!activePeriod) return;
-    setPeriods((prev) =>
-      prev.map((p) => {
-        if (p.id !== activePeriod.id) return p;
-        return {
-          ...p,
-          winners: p.winners.map((w) => (w.id === winnerId ? { ...w, isPaid: false } : w)),
-        };
-      })
-    );
-    showToast(`Penyerahan iuran ditarik kembali. Saldo arisan "${name}" kembali dipegang admin.`, 'warning');
+    try {
+      setIsSyncing(true);
+      await api.updateWinnerPayment(activePeriod.id, winnerId, false);
+      showToast(`Penyerahan iuran ditarik kembali. Saldo arisan "${name}" kembali dipegang admin.`, 'warning');
+      await refreshData();
+    } catch (err: any) {
+      showToast(`Gagal membatalkan serah terima: ${err.message}`, 'error');
+    } finally {
+      setIsSyncing(false);
+    }
   };
 
   return (
@@ -981,6 +952,16 @@ export default function App() {
                     {activePeriod.isClosed && (
                       <span id="closed-badge" className="bg-rose-600 text-white text-[10px] font-extrabold uppercase px-3 py-1 rounded-full border border-rose-500 shadow-sm flex items-center gap-1.5 animate-pulse">
                         🔒 Selesai & Ditutup
+                      </span>
+                    )}
+                    <span id="mongodb-status-badge" className="bg-emerald-50 text-emerald-700 text-[10px] font-bold px-3 py-1 rounded-full border border-emerald-200 shadow-xs flex items-center gap-1.5">
+                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                      Atlas Cloud Sync
+                    </span>
+                    {isSyncing && (
+                      <span id="syncing-badge" className="bg-amber-50 text-amber-700 text-[10px] font-bold px-3 py-1 rounded-full border border-amber-200 shadow-xs flex items-center gap-1.5">
+                        <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-spin" />
+                        Sedang Menyinkronkan...
                       </span>
                     )}
                   </div>
